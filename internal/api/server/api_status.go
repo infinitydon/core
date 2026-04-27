@@ -7,7 +7,16 @@ import (
 	"github.com/ellanetworks/core/internal/db"
 	"github.com/ellanetworks/core/internal/logger"
 	"github.com/ellanetworks/core/version"
+	"go.uber.org/zap"
 )
+
+// PendingMigrationResponse is non-nil only during a rolling-upgrade
+// window. Surfaced under cluster.pendingMigration.
+type PendingMigrationResponse struct {
+	CurrentSchema int `json:"currentSchema"`
+	TargetSchema  int `json:"targetSchema"`
+	LaggardNodeId int `json:"laggardNodeId,omitempty"`
+}
 
 type ClusterStatusResponse struct {
 	Enabled          bool   `json:"enabled"`
@@ -18,6 +27,12 @@ type ClusterStatusResponse struct {
 	AppliedIndex     uint64 `json:"appliedIndex"`
 	ClusterID        string `json:"clusterId,omitempty"`
 	LeaderAPIAddress string `json:"leaderAPIAddress,omitempty"`
+
+	// AppliedSchemaVersion is what the cluster has committed; the
+	// top-level SchemaVersion is what this binary supports. They
+	// differ only during a rolling upgrade.
+	AppliedSchemaVersion int                       `json:"appliedSchemaVersion"`
+	PendingMigration     *PendingMigrationResponse `json:"pendingMigration,omitempty"`
 }
 
 type StatusResponse struct {
@@ -67,6 +82,26 @@ func GetStatus(dbInstance *db.Database, ready *atomic.Bool) http.Handler {
 			}
 
 			clusterStatus.LeaderAPIAddress, clusterStatus.LeaderNodeID = resolveLeader(dbInstance)
+
+			// Schema fields are best-effort: read errors don't fail status.
+			if applied, err := dbInstance.CurrentSchemaVersion(ctx); err == nil {
+				clusterStatus.AppliedSchemaVersion = applied
+			} else {
+				logger.APILog.Warn("status: read applied schema failed", zap.Error(err))
+			}
+
+			if pending, err := dbInstance.PendingMigrationInfo(ctx); err == nil {
+				if pending.Pending {
+					clusterStatus.PendingMigration = &PendingMigrationResponse{
+						CurrentSchema: pending.CurrentSchema,
+						TargetSchema:  pending.TargetSchema,
+						LaggardNodeId: pending.LaggardNodeID,
+					}
+				}
+			} else {
+				logger.APILog.Warn("status: read pending migration info failed", zap.Error(err))
+			}
+
 			statusResponse.Cluster = clusterStatus
 
 			w.Header().Set("X-Ella-Role", role)

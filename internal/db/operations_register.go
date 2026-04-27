@@ -1,13 +1,10 @@
 // Copyright 2026 Ella Networks
 
 // Package-level registration of every typed replicated operation.
-// Exposed as vars so call sites can write `opFoo.Invoke(db, payload)`
-// without running a lookup on the hot path. registerChangesetOp panics
-// on duplicate names, so a collision surfaces at import time.
 //
-// Do not reuse names across schema versions: forwarded operations arriving
-// from a rolling upgrade reach this table keyed by name, and a silent
-// re-mapping would replicate the wrong statement.
+// Append-only: renaming, deleting, or relaxing RequireSchema breaks
+// rolling upgrades. TestOperationsRegistry_AppendOnly enforces this
+// against operations.lock.json.
 
 package db
 
@@ -29,19 +26,16 @@ var (
 	opClearDailyUsage     = registerChangesetOp("ClearDailyUsage", (*Database).applyClearDailyUsageOp)
 )
 
-// IP leases
+// IP leases. ip_leases.nodeID added in v9.
 var (
-	opCreateLease               = registerChangesetOp("CreateLease", (*Database).applyCreateLease)
-	opUpdateLeaseSession        = registerChangesetOp("UpdateLeaseSession", (*Database).applyUpdateLeaseSession)
-	opDeleteDynamicLease        = registerChangesetOp("DeleteDynamicLease", (*Database).applyDeleteDynamicLease)
-	opDeleteDynamicLeasesByNode = registerChangesetOp("DeleteDynamicLeasesByNode", (*Database).applyDeleteDynamicLeasesByNode)
-	opUpdateLeaseNode           = registerChangesetOp("UpdateLeaseNode", (*Database).applyUpdateLeaseNode)
-	// AllocateIPLease replaces the follower-side pre-pick-then-forward
-	// path. The wire payload is just the intent (poolID, IMSI, sessionID,
-	// nodeID); the leader's apply function does the SELECT-then-INSERT
-	// atomically inside leaderCaptureAndPropose, so concurrent allocations
-	// from any node are serialised by proposeMu.
-	opAllocateIPLease = registerChangesetOp("AllocateIPLease", (*Database).applyAllocateIPLease)
+	opCreateLease               = registerChangesetOp("CreateLease", (*Database).applyCreateLease, RequireSchema(9))
+	opUpdateLeaseSession        = registerChangesetOp("UpdateLeaseSession", (*Database).applyUpdateLeaseSession, RequireSchema(9))
+	opDeleteDynamicLease        = registerChangesetOp("DeleteDynamicLease", (*Database).applyDeleteDynamicLease, RequireSchema(9))
+	opDeleteDynamicLeasesByNode = registerChangesetOp("DeleteDynamicLeasesByNode", (*Database).applyDeleteDynamicLeasesByNode, RequireSchema(9))
+	opUpdateLeaseNode           = registerChangesetOp("UpdateLeaseNode", (*Database).applyUpdateLeaseNode, RequireSchema(9))
+	// AllocateIPLease forwards intent only; leader resolves the IP
+	// atomically under proposeMu (see applyAllocateIPLease).
+	opAllocateIPLease = registerChangesetOp("AllocateIPLease", (*Database).applyAllocateIPLease, RequireSchema(9))
 )
 
 // Audit logs
@@ -114,11 +108,11 @@ var (
 	opDeleteHomeNetworkKey = registerChangesetOp("DeleteHomeNetworkKey", (*Database).applyDeleteHomeNetworkKey)
 )
 
-// BGP
+// BGP. bgp_peers.nodeID added in v9.
 var (
-	opCreateBGPPeer            = registerChangesetOp("CreateBGPPeer", (*Database).applyCreateBGPPeer)
-	opUpdateBGPPeer            = registerChangesetOp("UpdateBGPPeer", (*Database).applyUpdateBGPPeer)
-	opDeleteBGPPeer            = registerChangesetOp("DeleteBGPPeer", (*Database).applyDeleteBGPPeer)
+	opCreateBGPPeer            = registerChangesetOp("CreateBGPPeer", (*Database).applyCreateBGPPeer, RequireSchema(9))
+	opUpdateBGPPeer            = registerChangesetOp("UpdateBGPPeer", (*Database).applyUpdateBGPPeer, RequireSchema(9))
+	opDeleteBGPPeer            = registerChangesetOp("DeleteBGPPeer", (*Database).applyDeleteBGPPeer, RequireSchema(9))
 	opUpdateBGPSettings        = registerChangesetOp("UpdateBGPSettings", (*Database).applyUpdateBGPSettings)
 	opSetImportPrefixesForPeer = registerChangesetOp("SetImportPrefixesForPeer", (*Database).applySetImportPrefixesForPeer)
 )
@@ -143,7 +137,7 @@ var (
 	opUpdateOperatorCode               = registerChangesetOp("UpdateOperatorCode", (*Database).applyUpdateOperatorCode)
 	opUpdateOperatorSecurityAlgorithms = registerChangesetOp("UpdateOperatorSecurityAlgorithms", (*Database).applyUpdateOperatorSecurityAlgorithms)
 	opUpdateOperatorSPN                = registerChangesetOp("UpdateOperatorSPN", (*Database).applyUpdateOperatorSPN)
-	opUpdateOperatorAMFIdentity        = registerChangesetOp("UpdateOperatorAMFIdentity", (*Database).applyUpdateOperatorAMFIdentity)
+	opUpdateOperatorAMFIdentity        = registerChangesetOp("UpdateOperatorAMFIdentity", (*Database).applyUpdateOperatorAMFIdentity, RequireSchema(9))
 	opUpdateOperatorClusterID          = registerChangesetOp("UpdateOperatorClusterID", (*Database).applyUpdateOperatorClusterID)
 )
 
@@ -158,31 +152,31 @@ var (
 	opDeleteRoute = registerChangesetOp("DeleteRoute", (*Database).applyDeleteRoute)
 )
 
-// Cluster members
+// Cluster members. cluster_members table introduced in v9.
 var (
-	opUpsertClusterMember = registerChangesetOp("UpsertClusterMember", (*Database).applyUpsertClusterMember)
-	opDeleteClusterMember = registerChangesetOp("DeleteClusterMember", (*Database).applyDeleteClusterMember)
-	opSetDrainState       = registerChangesetOp("SetDrainState", (*Database).applySetDrainState)
+	opUpsertClusterMember = registerChangesetOp("UpsertClusterMember", (*Database).applyUpsertClusterMember, RequireSchema(9))
+	opDeleteClusterMember = registerChangesetOp("DeleteClusterMember", (*Database).applyDeleteClusterMember, RequireSchema(9))
+	opSetDrainState       = registerChangesetOp("SetDrainState", (*Database).applySetDrainState, RequireSchema(9))
 )
 
-// Cluster PKI
+// Cluster PKI. All PKI tables introduced in v9.
 var (
-	opInsertPKIRoot            = registerChangesetOp("InsertPKIRoot", (*Database).applyInsertPKIRoot)
-	opSetPKIRootStatus         = registerChangesetOp("SetPKIRootStatus", (*Database).applySetPKIRootStatus)
-	opDeletePKIRoot            = registerChangesetOp("DeletePKIRoot", (*Database).applyDeletePKIRoot)
-	opInsertPKIIntermediate    = registerChangesetOp("InsertPKIIntermediate", (*Database).applyInsertPKIIntermediate)
-	opSetPKIIntermediateStatus = registerChangesetOp("SetPKIIntermediateStatus", (*Database).applySetPKIIntermediateStatus)
-	opDeletePKIIntermediate    = registerChangesetOp("DeletePKIIntermediate", (*Database).applyDeletePKIIntermediate)
-	opRecordIssuedCert         = registerChangesetOp("RecordIssuedCert", (*Database).applyInsertIssuedCert)
-	opDeleteExpiredIssuedCerts = registerChangesetOp("DeleteExpiredIssuedCerts", (*Database).applyDeleteIssuedCertsExpired)
-	opInsertRevokedCert        = registerChangesetOp("InsertRevokedCert", (*Database).applyInsertRevokedCert)
-	opDeletePurgedRevocations  = registerChangesetOp("DeletePurgedRevocations", (*Database).applyDeleteRevokedCertsPurged)
-	opMintJoinToken            = registerChangesetOp("MintJoinToken", (*Database).applyInsertJoinToken)
-	opConsumeJoinToken         = registerChangesetOp("ConsumeJoinToken", (*Database).applyConsumeJoinToken)
-	opDeleteStaleJoinTokens    = registerChangesetOp("DeleteStaleJoinTokens", (*Database).applyDeleteJoinTokensStale)
-	opInitializePKIState       = registerChangesetOp("InitializePKIState", (*Database).applyInitPKIState)
-	opBootstrapPKI             = registerChangesetOp("BootstrapPKI", (*Database).applyBootstrapPKIOp)
-	opAllocatePKISerial        = registerChangesetOp("AllocatePKISerial", (*Database).applyAllocatePKISerialOp)
+	opInsertPKIRoot            = registerChangesetOp("InsertPKIRoot", (*Database).applyInsertPKIRoot, RequireSchema(9))
+	opSetPKIRootStatus         = registerChangesetOp("SetPKIRootStatus", (*Database).applySetPKIRootStatus, RequireSchema(9))
+	opDeletePKIRoot            = registerChangesetOp("DeletePKIRoot", (*Database).applyDeletePKIRoot, RequireSchema(9))
+	opInsertPKIIntermediate    = registerChangesetOp("InsertPKIIntermediate", (*Database).applyInsertPKIIntermediate, RequireSchema(9))
+	opSetPKIIntermediateStatus = registerChangesetOp("SetPKIIntermediateStatus", (*Database).applySetPKIIntermediateStatus, RequireSchema(9))
+	opDeletePKIIntermediate    = registerChangesetOp("DeletePKIIntermediate", (*Database).applyDeletePKIIntermediate, RequireSchema(9))
+	opRecordIssuedCert         = registerChangesetOp("RecordIssuedCert", (*Database).applyInsertIssuedCert, RequireSchema(9))
+	opDeleteExpiredIssuedCerts = registerChangesetOp("DeleteExpiredIssuedCerts", (*Database).applyDeleteIssuedCertsExpired, RequireSchema(9))
+	opInsertRevokedCert        = registerChangesetOp("InsertRevokedCert", (*Database).applyInsertRevokedCert, RequireSchema(9))
+	opDeletePurgedRevocations  = registerChangesetOp("DeletePurgedRevocations", (*Database).applyDeleteRevokedCertsPurged, RequireSchema(9))
+	opMintJoinToken            = registerChangesetOp("MintJoinToken", (*Database).applyInsertJoinToken, RequireSchema(9))
+	opConsumeJoinToken         = registerChangesetOp("ConsumeJoinToken", (*Database).applyConsumeJoinToken, RequireSchema(9))
+	opDeleteStaleJoinTokens    = registerChangesetOp("DeleteStaleJoinTokens", (*Database).applyDeleteJoinTokensStale, RequireSchema(9))
+	opInitializePKIState       = registerChangesetOp("InitializePKIState", (*Database).applyInitPKIState, RequireSchema(9))
+	opBootstrapPKI             = registerChangesetOp("BootstrapPKI", (*Database).applyBootstrapPKIOp, RequireSchema(9))
+	opAllocatePKISerial        = registerChangesetOp("AllocatePKISerial", (*Database).applyAllocatePKISerialOp, RequireSchema(9))
 )
 
 // Intent ops — bulk deletes and migrations dispatched explicitly by the

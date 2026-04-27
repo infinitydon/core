@@ -297,6 +297,10 @@ type Database struct {
 	// FSM apply goroutines) never see a torn value. Readers use conn() to
 	// load the current pointer.
 	connPtr atomic.Pointer[sqlair.DB]
+
+	// appliedSchemaCache mirrors schema_version.version for the
+	// op-gate / apply-gate hot path. Updated by refreshAppliedSchema.
+	appliedSchemaCache atomic.Int64
 }
 
 // conn returns the current *sqlair.DB handle.
@@ -616,10 +620,9 @@ func (db *Database) CurrentSchemaVersion(ctx context.Context) (int, error) {
 	return v, nil
 }
 
-// RequireSchema returns ErrMigrationPending when the applied schema
-// version is below minVersion. Handlers that depend on a migration not
-// yet rolled out to every voter call this up-front; the 503 translation
-// in writeError maps the sentinel to a retryable status for clients.
+// RequireSchema returns ErrMigrationPending when applied < minVersion.
+// Prefer declaring RequireSchema(N) at op registration time; this
+// helper is for non-op-driven handlers that need the same check.
 func (db *Database) RequireSchema(ctx context.Context, minVersion int) error {
 	current, err := db.CurrentSchemaVersion(ctx)
 	if err != nil {
@@ -628,6 +631,80 @@ func (db *Database) RequireSchema(ctx context.Context, minVersion int) error {
 
 	if current < minVersion {
 		return ErrMigrationPending
+	}
+
+	return nil
+}
+
+// cachedAppliedSchema is an atomic-load read of schema_version.version
+// for the op-gate hot path. Returns 0 before the first refresh.
+func (db *Database) cachedAppliedSchema() int {
+	return int(db.appliedSchemaCache.Load())
+}
+
+// refreshAppliedSchema repopulates the cache from schema_version.
+// Called after initial migrations, after CmdMigrateShared apply, and
+// after Reopen.
+func (db *Database) refreshAppliedSchema(ctx context.Context) error {
+	v, err := db.CurrentSchemaVersion(ctx)
+	if err != nil {
+		return err
+	}
+
+	db.appliedSchemaCache.Store(int64(v))
+
+	return nil
+}
+
+// checkOpSchema is the call-time gate. Returns ErrMigrationPending
+// when applied < minSchema; minSchema <= 1 short-circuits.
+func (db *Database) checkOpSchema(minSchema int) error {
+	if minSchema <= 1 {
+		return nil
+	}
+
+	applied := db.cachedAppliedSchema()
+	if applied == 0 {
+		v, err := db.CurrentSchemaVersion(context.Background())
+		if err != nil {
+			return fmt.Errorf("op gate: read schema version: %w", err)
+		}
+
+		db.appliedSchemaCache.Store(int64(v))
+
+		applied = v
+	}
+
+	if applied < minSchema {
+		return ErrMigrationPending
+	}
+
+	return nil
+}
+
+// assertAppliedSchema is the apply-time counterpart. Returns a plain
+// error so the FSM panic handler halts the node (matching the contract
+// for any other apply failure).
+func (db *Database) assertAppliedSchema(ctx context.Context, required int, label string) error {
+	if required <= 1 {
+		return nil
+	}
+
+	applied := db.cachedAppliedSchema()
+	if applied == 0 {
+		v, err := db.CurrentSchemaVersion(ctx)
+		if err != nil {
+			return fmt.Errorf("apply gate: read schema version: %w", err)
+		}
+
+		db.appliedSchemaCache.Store(int64(v))
+
+		applied = v
+	}
+
+	if required > applied {
+		return fmt.Errorf("apply gate: %s requires schema %d, local applied %d",
+			label, required, applied)
 	}
 
 	return nil
@@ -696,6 +773,65 @@ func (db *Database) CheckPendingMigrations(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// PendingMigrationStatus is a read-only snapshot of cluster
+// migration readiness; surfaced on /api/v1/status.
+type PendingMigrationStatus struct {
+	Pending       bool
+	CurrentSchema int
+	TargetSchema  int // bounded by min(binaryMax, voter floor); equals current when blocked
+	LaggardNodeID int // voter holding target == current; zero when unblocked
+}
+
+// PendingMigrationInfo computes the snapshot. Read-only, safe on any
+// node — cluster_members is replicated so followers see the same
+// voter-capability data the leader uses.
+func (db *Database) PendingMigrationInfo(ctx context.Context) (PendingMigrationStatus, error) {
+	current, err := db.CurrentSchemaVersion(ctx)
+	if err != nil {
+		return PendingMigrationStatus{}, fmt.Errorf("read schema version: %w", err)
+	}
+
+	binaryMax := SchemaVersion()
+	if current >= binaryMax {
+		return PendingMigrationStatus{
+			Pending:       false,
+			CurrentSchema: current,
+			TargetSchema:  current,
+		}, nil
+	}
+
+	// Standalone (no raft): no voters to gate on.
+	if db.raftManager == nil {
+		return PendingMigrationStatus{
+			Pending:       true,
+			CurrentSchema: current,
+			TargetSchema:  binaryMax,
+		}, nil
+	}
+
+	floor, laggard, err := db.minVoterSchemaSupport(ctx)
+	if err != nil {
+		return PendingMigrationStatus{}, err
+	}
+
+	target := binaryMax
+	if floor < target {
+		target = floor
+	}
+
+	status := PendingMigrationStatus{
+		Pending:       true,
+		CurrentSchema: current,
+		TargetSchema:  target,
+	}
+
+	if target == current {
+		status.LaggardNodeID = laggard
+	}
+
+	return status, nil
 }
 
 // minVoterSchemaSupport returns the minimum maxSchemaVersion across
@@ -918,6 +1054,11 @@ func NewDatabase(ctx context.Context, dbPath string, raftCfg ellaraft.ClusterCon
 		return nil, fmt.Errorf("failed table replication classification check: %w", err)
 	}
 
+	if err := db.refreshAppliedSchema(ctx); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("seed applied-schema cache: %w", err)
+	}
+
 	if err := db.PrepareStatements(); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("failed to prepare statements: %w", err)
@@ -993,6 +1134,11 @@ func NewDatabaseWithoutRaft(ctx context.Context, dbPath string) (*Database, erro
 		return nil, fmt.Errorf("failed table replication classification check: %w", err)
 	}
 
+	if err := db.refreshAppliedSchema(ctx); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("seed applied-schema cache: %w", err)
+	}
+
 	if err := db.PrepareStatements(); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("failed to prepare statements: %w", err)
@@ -1008,6 +1154,13 @@ func NewDatabaseWithoutRaft(ctx context.Context, dbPath string) (*Database, erro
 	return db, nil
 }
 
+// PrepareStatements compiles every registered sqlair.Statement.
+//
+// Forward-compat: when a post-baseline migration (v10+) adds a column
+// referenced by a new statement, gate that statement on
+// db.cachedAppliedSchema() — the matching op's RequireSchema prevents
+// callers from reaching the unprepared pointer. See
+// spec_rolling_upgrade.md §3.2 for the re-prep follow-up.
 func (db *Database) PrepareStatements() error {
 	type stmtDef struct {
 		dest  **sqlair.Statement

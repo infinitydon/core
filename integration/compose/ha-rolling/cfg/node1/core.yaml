@@ -1,0 +1,5 @@
+# Stub overwritten by writeNodeConfig at test time.
+logging:
+  system:
+    level: "debug"
+    output: "stdout"

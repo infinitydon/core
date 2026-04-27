@@ -14,21 +14,32 @@ import (
 	"github.com/canonical/sqlair"
 	"github.com/ellanetworks/core/internal/dbwriter"
 	"github.com/ellanetworks/core/internal/ipam"
+	"github.com/ellanetworks/core/internal/logger"
 	ellaraft "github.com/ellanetworks/core/internal/raft"
 	hraft "github.com/hashicorp/raft"
+	"go.uber.org/zap"
 )
 
 // Compile-time check that *Database implements ellaraft.Applier.
 var _ ellaraft.Applier = (*Database)(nil)
 
-// ApplyCommand dispatches a Raft command to the appropriate applyX method.
-// Called by the FSM on every node (leader and followers) for each committed
-// log entry. Each applyX uses sqlair to execute SQL against the shared database.
+// ApplyCommand dispatches a Raft command to its applyX method on
+// every node. assertAppliedSchema gates each dispatch on the
+// per-command minSchema (RequiredSchema for CmdChangeset, intent op
+// minSchema for the rest); a violation returns an error and the FSM
+// panics, matching the contract for any other apply failure. The gate
+// is defensive — Raft applies in log order and the leader proposes
+// CmdMigrateShared(N) before any v=N op, so it only fires on leader
+// misbehavior or skip-version upgrades (already a non-goal).
 func (db *Database) ApplyCommand(ctx context.Context, cmd *ellaraft.Command) (any, error) {
 	switch cmd.Type {
 	case ellaraft.CmdChangeset:
 		payload, err := unmarshalPayload[bytesPayload](cmd.Payload)
 		if err != nil {
+			return nil, err
+		}
+
+		if err := db.assertAppliedSchema(ctx, payload.RequiredSchema, fmt.Sprintf("changeset %q", payload.Operation)); err != nil {
 			return nil, err
 		}
 
@@ -40,6 +51,10 @@ func (db *Database) ApplyCommand(ctx context.Context, cmd *ellaraft.Command) (an
 		return result, applyErr
 
 	case ellaraft.CmdDeleteOldAuditLogs:
+		if err := db.assertAppliedSchema(ctx, intentMinSchemaForCmd(cmd.Type), cmd.Type.String()); err != nil {
+			return nil, err
+		}
+
 		payload, err := unmarshalPayload[stringPayload](cmd.Payload)
 		if err != nil {
 			return nil, err
@@ -48,6 +63,10 @@ func (db *Database) ApplyCommand(ctx context.Context, cmd *ellaraft.Command) (an
 		return db.applyDeleteOldAuditLogs(ctx, payload)
 
 	case ellaraft.CmdDeleteOldDailyUsage:
+		if err := db.assertAppliedSchema(ctx, intentMinSchemaForCmd(cmd.Type), cmd.Type.String()); err != nil {
+			return nil, err
+		}
+
 		payload, err := unmarshalPayload[int64Payload](cmd.Payload)
 		if err != nil {
 			return nil, err
@@ -56,9 +75,17 @@ func (db *Database) ApplyCommand(ctx context.Context, cmd *ellaraft.Command) (an
 		return db.applyDeleteOldDailyUsage(ctx, payload)
 
 	case ellaraft.CmdDeleteAllDynamicLeases:
+		if err := db.assertAppliedSchema(ctx, intentMinSchemaForCmd(cmd.Type), cmd.Type.String()); err != nil {
+			return nil, err
+		}
+
 		return nil, db.applyDeleteAllDynamicLeases(ctx)
 
 	case ellaraft.CmdDeleteExpiredSessions:
+		if err := db.assertAppliedSchema(ctx, intentMinSchemaForCmd(cmd.Type), cmd.Type.String()); err != nil {
+			return nil, err
+		}
+
 		payload, err := unmarshalPayload[int64Payload](cmd.Payload)
 		if err != nil {
 			return nil, err
@@ -75,6 +102,11 @@ func (db *Database) ApplyCommand(ctx context.Context, cmd *ellaraft.Command) (an
 		result, applyErr := db.applyMigrateShared(ctx, payload)
 		if applyErr == nil {
 			db.signalMigrationCheck()
+
+			if err := db.refreshAppliedSchema(ctx); err != nil {
+				logger.DBLog.Warn("refresh applied-schema cache after migrate-shared apply",
+					zap.Error(err))
+			}
 		}
 
 		return result, applyErr
@@ -125,6 +157,10 @@ func (db *Database) Reopen(ctx context.Context) error {
 		_ = old.PlainDB().Close()
 	}
 
+	if err := db.refreshAppliedSchema(ctx); err != nil {
+		return fmt.Errorf("refresh applied-schema cache after reopen: %w", err)
+	}
+
 	if err := db.PrepareStatements(); err != nil {
 		return fmt.Errorf("re-prepare statements: %w", err)
 	}
@@ -156,8 +192,9 @@ type (
 		Value bool `json:"value"`
 	}
 	bytesPayload struct {
-		Value     []byte `json:"value"`
-		Operation string `json:"operation,omitempty"`
+		Value          []byte `json:"value"`
+		Operation      string `json:"operation,omitempty"`
+		RequiredSchema int    `json:"requiredSchema,omitempty"`
 	}
 	auditLogPayload struct {
 		Timestamp string `json:"timestamp"`

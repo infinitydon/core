@@ -2,6 +2,13 @@ package client
 
 import "context"
 
+// PendingMigration is non-nil only during a rolling-upgrade window.
+type PendingMigration struct {
+	CurrentSchema int `json:"currentSchema"`
+	TargetSchema  int `json:"targetSchema"`
+	LaggardNodeId int `json:"laggardNodeId,omitempty"`
+}
+
 type ClusterStatus struct {
 	Enabled          bool   `json:"enabled"`
 	Role             string `json:"role"`
@@ -11,6 +18,12 @@ type ClusterStatus struct {
 	AppliedIndex     uint64 `json:"appliedIndex"`
 	ClusterID        string `json:"clusterId,omitempty"`
 	LeaderAPIAddress string `json:"leaderAPIAddress,omitempty"`
+
+	// AppliedSchemaVersion is what the cluster has committed; the
+	// parent SchemaVersion is what this binary supports. They differ
+	// only mid-rolling-upgrade.
+	AppliedSchemaVersion int               `json:"appliedSchemaVersion"`
+	PendingMigration     *PendingMigration `json:"pendingMigration,omitempty"`
 }
 
 type Status struct {
