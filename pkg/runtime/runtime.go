@@ -131,8 +131,8 @@ func Start(ctx context.Context, rc RuntimeConfig) error {
 
 		restoredFromBundle = restored
 
-		// cluster-id is unknown until PostInitClusterSetup populates
-		// the operator row; the agent re-reads it before signing CSRs.
+		// cluster-id is unknown at construction; the agent re-reads it
+		// before signing CSRs.
 		pki = newPKIState(cfg.Cluster.NodeID, "", dataDir)
 
 		// Join-token path runs before the listener comes up so raft
@@ -208,7 +208,7 @@ func Start(ctx context.Context, rc RuntimeConfig) error {
 	}
 
 	if clusterLn != nil {
-		stopClusterHTTP := server.StartClusterHTTP(dbInstance, clusterLn, apiServer.Handler())
+		stopClusterHTTP := server.StartClusterHTTP(dbInstance, clusterLn)
 		defer stopClusterHTTP()
 
 		if err := clusterLn.Start(ctx); err != nil {
@@ -220,23 +220,12 @@ func Start(ctx context.Context, rc RuntimeConfig) error {
 		return fmt.Errorf("cluster discovery failed: %w", err)
 	}
 
-	// Seed default settings and clean up stale leases. In standalone
-	// mode Initialize already ran inside NewDatabase; in HA mode only
-	// the leader proposes the writes and followers replicate them.
+	// Leader-side init runs from runLeaderInit via the OnBecameLeader
+	// callback registered below. Followers block here until the
+	// leader's Initialize replicates. Standalone runs Initialize from
+	// NewDatabase.
 	if cfg.Cluster.Enabled {
-		if dbInstance.IsLeader() {
-			if err := dbInstance.Initialize(ctx); err != nil {
-				return fmt.Errorf("couldn't initialize database: %w", err)
-			}
-
-			if err := dbInstance.PostInitClusterSetup(ctx, ver.Version); err != nil {
-				return fmt.Errorf("couldn't set up cluster: %w", err)
-			}
-
-			if err := dbInstance.DeleteAllDynamicLeases(ctx); err != nil {
-				return fmt.Errorf("couldn't release all dynamic leases: %w", err)
-			}
-		} else {
+		if !dbInstance.IsLeader() {
 			logger.EllaLog.Info("Waiting for leader initialization to replicate")
 
 			if err := dbInstance.WaitForInitialization(ctx, 30*time.Second); err != nil {
@@ -287,11 +276,8 @@ func Start(ctx context.Context, rc RuntimeConfig) error {
 		observer.Register(jobsGuard)
 		observer.Register(server.NewLeadershipAuditCallback(dbInstance.NodeID()))
 
-		// Wire PKI setup to every leader transition so a follower that
-		// later becomes leader loads its keys (if present) and publishes
-		// the issuer service.
 		if pki != nil {
-			observer.Register(newPKILeaderCallback(ctx, pki, dbInstance, clusterLn, cfg.Cluster.NodeID, restoredFromBundle))
+			observer.Register(newPKILeaderCallback(ctx, pki, dbInstance, clusterLn, cfg.Cluster.NodeID, ver.Version, restoredFromBundle))
 		}
 	}
 
@@ -391,7 +377,10 @@ func Start(ctx context.Context, rc RuntimeConfig) error {
 	// disabled — the reconciler's calls are no-ops against a stopped
 	// service, and starting here means re-enabling BGP via the API does
 	// not need separate reconciler wiring.
-	bgpReconciler := bgp.NewReconciler(bgpService, &bgpLeaseStoreAdapter{db: dbInstance}, dbInstance.NodeID())
+	bgpWakeup, stopBgpWakeup := dbInstance.Changefeed().Wakeup(db.TopicIPLeases)
+	defer stopBgpWakeup()
+
+	bgpReconciler := bgp.NewReconciler(bgpService, &bgpLeaseStoreAdapter{db: dbInstance}, dbInstance.NodeID(), bgpWakeup)
 	bgpReconciler.Start()
 
 	n3Settings, err := dbInstance.GetN3Settings(ctx)
@@ -428,6 +417,12 @@ func Start(ctx context.Context, rc RuntimeConfig) error {
 	if err != nil {
 		return fmt.Errorf("couldn't start UPF: %w", err)
 	}
+
+	fallbackN3, _ := netip.ParseAddr(n3IPv4)
+	upfReconciler := upf.NewSettingsReconciler(upfInstance, dbInstance, dbInstance.Changefeed(), fallbackN3)
+	upfReconciler.Start()
+
+	defer upfReconciler.Stop()
 
 	eng := upfInstance.Engine()
 
@@ -495,7 +490,6 @@ func Start(ctx context.Context, rc RuntimeConfig) error {
 	// the cluster is formed, settings are seeded, and NFs are running. ---
 	if err := apiServer.Upgrade(ctx, api.UpgradeConfig{
 		DB:                  dbInstance,
-		UPF:                 upfInstance,
 		Sessions:            smfInstance,
 		AMF:                 amfInstance,
 		BGP:                 bgpService,

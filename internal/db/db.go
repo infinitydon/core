@@ -40,6 +40,10 @@ type Database struct {
 	raftManager    *ellaraft.Manager
 	proposeTimeout time.Duration
 
+	// changefeed broadcasts post-apply events to in-process
+	// subscribers (reconcilers). Always non-nil.
+	changefeed *Changefeed
+
 	// migrationCheckCh fan-ins re-trigger signals from the FSM applier
 	// (after UpsertClusterMember or CmdMigrateShared commits) so the
 	// leader re-runs CheckPendingMigrations without waiting for the
@@ -485,6 +489,12 @@ func (db *Database) RaftAppliedIndex() uint64 {
 	return db.raftManager.AppliedIndex()
 }
 
+// Changefeed exposes the in-process broker used by reconcilers to wake
+// up on replicated state changes.
+func (db *Database) Changefeed() *Changefeed {
+	return db.changefeed
+}
+
 // LeaderObserver returns the Raft leadership observer for registering
 // callbacks that react to leadership transitions.
 func (db *Database) LeaderObserver() *ellaraft.LeaderObserver {
@@ -546,6 +556,17 @@ func (db *Database) LeaderAddressAndID() (string, int) {
 	}
 
 	return db.raftManager.LeaderAddressAndID()
+}
+
+// DoLeaderRequest performs a one-shot HTTP request against the current
+// leader's cluster mTLS port. Used for follower-side reads of state
+// that lives only on the leader.
+func (db *Database) DoLeaderRequest(ctx context.Context, method, path string, body []byte, contentType string) (*ellaraft.LeaderResponse, error) {
+	if db.raftManager == nil {
+		return nil, fmt.Errorf("clustering not enabled")
+	}
+
+	return db.raftManager.LeaderRequest(ctx, method, path, body, contentType)
 }
 
 // RaftState returns the current Raft state as a string (Leader, Follower, etc.).
@@ -916,26 +937,34 @@ func (db *Database) RunDiscovery(ctx context.Context) error {
 	return nil
 }
 
-// PostInitClusterSetup generates the cluster ID (if absent) and upserts this
-// node's cluster_members row. Must be called on the leader after Initialize()
-// has seeded the operator row.
-func (db *Database) PostInitClusterSetup(ctx context.Context, binaryVersion string) error {
-	if db.raftManager == nil || !db.raftManager.IsLeader() {
+// ensureClusterID populates the operator row's ClusterID if empty.
+// Run from Initialize() so a standalone DB carries one too — the PKI
+// bootstrap on a later cluster-mode boot needs it.
+func (db *Database) ensureClusterID(ctx context.Context) error {
+	op, err := db.GetOperator(ctx)
+	if err != nil {
+		return fmt.Errorf("read operator: %w", err)
+	}
+
+	if op.ClusterID != "" {
 		return nil
 	}
 
-	op, err := db.GetOperator(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to read operator for cluster ID check: %w", err)
+	clusterID := uuid.New().String()
+	if err := db.UpdateOperatorClusterID(ctx, clusterID); err != nil {
+		return fmt.Errorf("set cluster ID: %w", err)
 	}
 
-	if op.ClusterID == "" {
-		clusterID := uuid.New().String()
-		if err := db.UpdateOperatorClusterID(ctx, clusterID); err != nil {
-			return fmt.Errorf("failed to set cluster ID: %w", err)
-		}
+	logger.WithTrace(ctx, logger.DBLog).Info("Generated cluster ID", zap.String("cluster_id", clusterID))
 
-		logger.WithTrace(ctx, logger.DBLog).Info("Generated cluster ID", zap.String("cluster_id", clusterID))
+	return nil
+}
+
+// PostInitClusterSetup upserts this node's cluster_members row.
+// Leader-only.
+func (db *Database) PostInitClusterSetup(ctx context.Context, binaryVersion string) error {
+	if db.raftManager == nil || !db.raftManager.IsLeader() {
+		return nil
 	}
 
 	if err := db.selfUpsertClusterMember(ctx, binaryVersion); err != nil {
@@ -1048,6 +1077,7 @@ func NewDatabase(ctx context.Context, dbPath string, raftCfg ellaraft.ClusterCon
 	db.connPtr.Store(sqlair.NewDB(sqlConn))
 	db.dbPath = dbPath
 	db.dataDir = dataDir
+	db.changefeed = NewChangefeed()
 
 	if err := db.assertTableReplicationClassification(ctx); err != nil {
 		_ = db.Close()
@@ -1128,6 +1158,7 @@ func NewDatabaseWithoutRaft(ctx context.Context, dbPath string) (*Database, erro
 	db.connPtr.Store(sqlair.NewDB(sqlConn))
 	db.dbPath = dbPath
 	db.dataDir = dataDir
+	db.changefeed = NewChangefeed()
 
 	if err := db.assertTableReplicationClassification(ctx); err != nil {
 		_ = db.Close()
@@ -1488,6 +1519,10 @@ func (db *Database) Initialize(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("failed to initialize network configuration: %v", err)
 		}
+	}
+
+	if err := db.ensureClusterID(ctx); err != nil {
+		return fmt.Errorf("failed to ensure cluster ID: %w", err)
 	}
 
 	numKeys, err := db.CountHomeNetworkKeys(ctx)

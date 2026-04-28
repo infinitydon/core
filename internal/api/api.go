@@ -46,6 +46,11 @@ const (
 // In tests we can override it to disable actual reconciliation.
 var routeReconciler = ReconcileKernelRouting
 
+// routeReconcileBackstop is the periodic invariant-checking sweep
+// when no change events have fired. The primary trigger is the
+// changefeed; this exists only to recover from missed signals.
+const routeReconcileBackstop = 5 * time.Minute
+
 // Server wraps the HTTP server and supports two-phase startup. Phase one
 // (StartDiscovery) starts the listener with only the routes needed for
 // cluster discovery. Phase two (Upgrade) swaps in the full API handler
@@ -81,7 +86,6 @@ func (hr *handlerRef) set(h http.Handler) {
 // from discovery-only routes to the full API.
 type UpgradeConfig struct {
 	DB                  *db.Database
-	UPF                 server.UPFUpdater
 	Sessions            smf.SessionQuerier
 	AMF                 *amf.AMF
 	BGP                 *bgp.BGPService
@@ -220,8 +224,6 @@ func (s *Server) Upgrade(ctx context.Context, opts UpgradeConfig) error {
 	fullHandler := server.NewHandler(server.HandlerConfig{
 		DB:                  opts.DB,
 		Config:              s.cfg,
-		UPF:                 opts.UPF,
-		Kernel:              kernelInt,
 		JWTSecret:           jwtSecret,
 		SecureCookie:        secureCookie,
 		FrontendFS:          opts.EmbedFS,
@@ -249,22 +251,110 @@ func (s *Server) Upgrade(ctx context.Context, opts UpgradeConfig) error {
 	reconcile := routeReconciler
 
 	go func() {
-		for {
-			err := reconcile(ctx, opts.DB, kernelInt)
-			if err != nil {
+		sub := opts.DB.Changefeed().Subscribe(db.TopicRoutes)
+		defer sub.Close()
+
+		runReconcile := func() {
+			if err := reconcile(ctx, opts.DB, kernelInt); err != nil {
 				logger.APILog.Error("couldn't reconcile routes", zap.Error(err))
 			}
+		}
 
+		runReconcile()
+
+		backstop := time.NewTicker(routeReconcileBackstop)
+		defer backstop.Stop()
+
+		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(5 * time.Minute):
-				continue
+			case <-sub.Events:
+				runReconcile()
+			case <-sub.Dropped:
+				runReconcile()
+			case <-backstop.C:
+				runReconcile()
 			}
 		}
 	}()
 
+	if opts.BGP != nil {
+		bgpStore := &bgpSettingsStoreAdapter{db: opts.DB}
+		filterBuilder := func(fbCtx context.Context) (*bgp.RouteFilter, error) {
+			pools := server.CollectUEPools(fbCtx, opts.DB)
+			n3Addr, _ := netip.ParseAddr(s.cfg.Interfaces.N3.Address)
+
+			return bgp.BuildRouteFilter(pools, n3Addr, s.cfg.Interfaces.N6.Name), nil
+		}
+
+		bgpSettingsWakeup, stopBGPSettingsWakeup := opts.DB.Changefeed().Wakeup(
+			db.TopicBGPSettings,
+			db.TopicBGPPeers,
+			db.TopicNATSettings,
+			db.TopicDataNetworks,
+		)
+
+		bgpReconciler := bgp.NewSettingsReconciler(opts.BGP, bgpStore, filterBuilder, bgpSettingsWakeup)
+		seedReconcilerFromCurrentState(ctx, bgpReconciler, opts.DB)
+		bgpReconciler.Start()
+
+		go func() {
+			<-ctx.Done()
+			bgpReconciler.Stop()
+			stopBGPSettingsWakeup()
+		}()
+	}
+
 	return nil
+}
+
+// bgpSettingsStoreAdapter adapts *db.Database to bgp.SettingsStore,
+// converting from the DB row types into the BGP service's own types
+// so the bgp package does not depend on db.
+type bgpSettingsStoreAdapter struct {
+	db *db.Database
+}
+
+func (a *bgpSettingsStoreAdapter) GetSettings(ctx context.Context) (bgp.BGPSettings, error) {
+	settings, err := a.db.GetBGPSettings(ctx)
+	if err != nil {
+		return bgp.BGPSettings{}, err
+	}
+
+	return server.DBSettingsToBGPSettings(settings), nil
+}
+
+func (a *bgpSettingsStoreAdapter) ListPeers(ctx context.Context) ([]bgp.BGPPeer, error) {
+	dbPeers, err := a.db.ListAllBGPPeers(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return server.DBPeersToBGPPeers(dbPeers), nil
+}
+
+func (a *bgpSettingsStoreAdapter) IsNATEnabled(ctx context.Context) (bool, error) {
+	return a.db.IsNATEnabled(ctx)
+}
+
+func seedReconcilerFromCurrentState(ctx context.Context, r *bgp.SettingsReconciler, dbInstance *db.Database) {
+	settings, err := dbInstance.GetBGPSettings(ctx)
+	if err != nil {
+		return
+	}
+
+	dbPeers, err := dbInstance.ListAllBGPPeers(ctx)
+	if err != nil {
+		return
+	}
+
+	natEnabled, err := dbInstance.IsNATEnabled(ctx)
+	if err != nil {
+		return
+	}
+
+	r.MarkApplied(server.DBSettingsToBGPSettings(settings), server.DBPeersToBGPPeers(dbPeers), !natEnabled)
 }
 
 // Handler returns the swappable HTTP handler backing the API server.
@@ -288,6 +378,16 @@ func resolveScheme(cfg config.Config) Scheme {
 	return HTTPS
 }
 
+// ReconcileKernelRouting drives this node's kernel routing table from
+// the replicated routes table. It both adds DB routes that are missing
+// from the kernel and removes Ella-owned kernel routes that no longer
+// have a DB counterpart. Operator-installed routes are untouched
+// because the deletion pass is scoped to Ella's protocol marker.
+//
+// BGP-learned routes are managed by internal/bgp/watcher.go; this
+// reconciler skips the bgpRouteMetric to avoid stepping on it.
+const bgpRouteMetric = 200
+
 func ReconcileKernelRouting(ctx context.Context, dbInstance *db.Database, kernelInt kernel.Kernel) error {
 	expectedRoutes, _, err := dbInstance.ListRoutesPage(ctx, 1, 100)
 	if err != nil {
@@ -306,6 +406,15 @@ func ReconcileKernelRouting(ctx context.Context, dbInstance *db.Database, kernel
 		}
 	}
 
+	type routeKey struct {
+		destination string
+		gateway     string
+		priority    int
+		ifKey       kernel.NetworkInterface
+	}
+
+	desired := make(map[routeKey]struct{}, len(expectedRoutes))
+
 	for _, route := range expectedRoutes {
 		destPrefix, err := netip.ParsePrefix(route.Destination)
 		if err != nil {
@@ -322,6 +431,13 @@ func ReconcileKernelRouting(ctx context.Context, dbInstance *db.Database, kernel
 			return fmt.Errorf("invalid interface: %v", route.Interface)
 		}
 
+		desired[routeKey{
+			destination: destPrefix.String(),
+			gateway:     gwAddr.String(),
+			priority:    route.Metric,
+			ifKey:       kernelNetworkInterface,
+		}] = struct{}{}
+
 		routeExists, err := kernelInt.RouteExists(destPrefix, gwAddr, route.Metric, kernelNetworkInterface)
 		if err != nil {
 			return fmt.Errorf("couldn't check if route exists: %v", err)
@@ -331,6 +447,39 @@ func ReconcileKernelRouting(ctx context.Context, dbInstance *db.Database, kernel
 			err := kernelInt.CreateRoute(destPrefix, gwAddr, route.Metric, kernelNetworkInterface)
 			if err != nil {
 				return fmt.Errorf("couldn't create route: %v", err)
+			}
+		}
+	}
+
+	for _, netIf := range interfaceDBKernelMap {
+		managed, err := kernelInt.ListManagedRoutes(netIf)
+		if err != nil {
+			return fmt.Errorf("couldn't list managed routes on %v: %v", netIf, err)
+		}
+
+		for _, r := range managed {
+			// BGP watcher owns its own metric; never reclaim those here.
+			if r.Priority == bgpRouteMetric {
+				continue
+			}
+
+			key := routeKey{
+				destination: r.Destination.String(),
+				gateway:     r.Gateway.String(),
+				priority:    r.Priority,
+				ifKey:       netIf,
+			}
+
+			if _, ok := desired[key]; ok {
+				continue
+			}
+
+			if err := kernelInt.DeleteRoute(r.Destination, r.Gateway, r.Priority, netIf); err != nil {
+				logger.APILog.Warn("couldn't delete stale route",
+					zap.String("destination", r.Destination.String()),
+					zap.String("gateway", r.Gateway.String()),
+					zap.Int("priority", r.Priority),
+					zap.Error(err))
 			}
 		}
 	}
