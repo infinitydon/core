@@ -2,7 +2,7 @@ name: CNTi Essential
 
 on:
   push:
-    branches: [main]
+    branches: [main, codex/cnti-badge-validation]
     paths:
       - 'k8s/**'
       - '.github/cnti/**'
