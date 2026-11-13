@@ -1,0 +1,16 @@
+name: Snap Store probe
+on:
+  push:
+    branches: [codex/snap-store-probe]
+  workflow_dispatch:
+permissions: {}
+jobs:
+  lxd:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 8
+    steps:
+      - name: Check Snap Store metadata
+        run: curl -fsS --max-time 20 -o /dev/null -w 'LXD metadata HTTP %{http_code}\n' -H 'Snap-Device-Series: 16' https://api.snapcraft.io/v2/snaps/info/lxd
+      - name: Install LXD as in the upstream build
+        if: always()
+        run: sudo snap install lxd --cohort +
