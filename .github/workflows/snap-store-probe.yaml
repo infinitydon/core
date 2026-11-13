@@ -10,7 +10,9 @@ jobs:
     timeout-minutes: 8
     steps:
       - name: Check Snap Store metadata
-        run: curl -fsS --max-time 20 -o /dev/null -w 'LXD metadata HTTP %{http_code}\n' -H 'Snap-Device-Series: 16' https://api.snapcraft.io/v2/snaps/info/lxd
+        run: |
+          curl -fsS --max-time 20 -o /dev/null -w 'LXD metadata HTTP %{http_code}\n' -H 'Snap-Device-Series: 16' https://api.snapcraft.io/v2/snaps/info/lxd
       - name: Install LXD as in the upstream build
         if: always()
         run: sudo snap install lxd --cohort +
+
